@@ -1,0 +1,190 @@
+#pragma kernel VoxelizeTriangles
+#pragma kernel DilateSurface
+#pragma kernel FloodFillStep
+#pragma kernel FinalizeSolidInterior
+
+struct Triangle
+{
+    float3 a;
+    float3 b;
+    float3 c;
+};
+
+StructuredBuffer<Triangle> _Triangles;
+RWStructuredBuffer<uint> _VoxelGrid; // 0=air, 1=surface, 2=interior, 255=exterior
+RWStructuredBuffer<uint> _DilationOut;
+RWStructuredBuffer<uint> _ChangedFlag; // For iterative flood fill
+
+uint _TriangleCount;
+int3 _GridSize; // width, height, depth
+float3 _GridOrigin;
+float _VoxelSize;
+
+int GetIndex(int3 coord)
+{
+    return coord.x + coord.y * _GridSize.x + coord.z * _GridSize.x * _GridSize.y;
+}
+
+bool IntersectsTriangleAABB(float3 center, float3 extents, float3 v0, float3 v1, float3 v2)
+{
+    v0 -= center;
+    v1 -= center;
+    v2 -= center;
+
+    float3 f0 = v1 - v0;
+    float3 f1 = v2 - v1;
+    float3 f2 = v0 - v2;
+
+    // SAT edge cross axis tests
+    // Axis X cross f0
+    float p0 = v0.y * (-f0.z) + v0.z * f0.y;
+    float p2 = v2.y * (-f0.z) + v2.z * f0.y;
+    float minP = min(p0, p2);
+    float maxP = max(p0, p2);
+    float rad = extents.y * abs(-f0.z) + extents.z * abs(f0.y);
+    if (minP > rad || maxP < -rad) return false;
+
+    // Axis Y cross f0
+    p0 = v0.x * f0.z + v0.z * (-f0.x);
+    p2 = v2.x * f0.z + v2.z * (-f0.x);
+    minP = min(p0, p2);
+    maxP = max(p0, p2);
+    rad = extents.x * abs(f0.z) + extents.z * abs(-f0.x);
+    if (minP > rad || maxP < -rad) return false;
+
+    // Axis Z cross f0
+    p0 = v0.x * (-f0.y) + v0.y * f0.x;
+    float p1 = v1.x * (-f0.y) + v1.y * f0.x;
+    minP = min(p0, p1);
+    maxP = max(p0, p1);
+    rad = extents.x * abs(-f0.y) + extents.y * abs(f0.x);
+    if (minP > rad || maxP < -rad) return false;
+
+    // AABB overlap tests
+    minP = min(v0.x, min(v1.x, v2.x));
+    maxP = max(v0.x, max(v1.x, v2.x));
+    if (minP > extents.x || maxP < -extents.x) return false;
+
+    minP = min(v0.y, min(v1.y, v2.y));
+    maxP = max(v0.y, max(v1.y, v2.y));
+    if (minP > extents.y || maxP < -extents.y) return false;
+
+    minP = min(v0.z, min(v1.z, v2.z));
+    maxP = max(v0.z, max(v1.z, v2.z));
+    if (minP > extents.z || maxP < -extents.z) return false;
+
+    // Triangle normal plane test
+    float3 normal = cross(f0, f1);
+    float d = dot(normal, v0);
+    rad = extents.x * abs(normal.x) + extents.y * abs(normal.y) + extents.z * abs(normal.z);
+    if (abs(d) > rad) return false;
+
+    return true;
+}
+
+[numthreads(64, 1, 1)]
+void VoxelizeTriangles(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _TriangleCount) return;
+
+    Triangle tri = _Triangles[id.x];
+    float3 extents = float3(_VoxelSize * 0.5f, _VoxelSize * 0.5f, _VoxelSize * 0.5f);
+
+    float3 minPos = min(tri.a, min(tri.b, tri.c));
+    float3 maxPos = max(tri.a, max(tri.b, tri.c));
+
+    int minX = clamp((int)floor((minPos.x - _GridOrigin.x) / _VoxelSize), 0, _GridSize.x - 1);
+    int maxX = clamp((int)ceil((maxPos.x - _GridOrigin.x) / _VoxelSize), 0, _GridSize.x - 1);
+    int minY = clamp((int)floor((minPos.y - _GridOrigin.y) / _VoxelSize), 0, _GridSize.y - 1);
+    int maxY = clamp((int)ceil((maxPos.y - _GridOrigin.y) / _VoxelSize), 0, _GridSize.y - 1);
+    int minZ = clamp((int)floor((minPos.z - _GridOrigin.z) / _VoxelSize), 0, _GridSize.z - 1);
+    int maxZ = clamp((int)ceil((maxPos.z - _GridOrigin.z) / _VoxelSize), 0, _GridSize.z - 1);
+
+    for (int z = minZ; z <= maxZ; z++)
+    {
+        for (int y = minY; y <= maxY; y++)
+        {
+            for (int x = minX; x <= maxX; x++)
+            {
+                float3 voxelCenter = _GridOrigin + float3((x + 0.5f) * _VoxelSize, (y + 0.5f) * _VoxelSize, (z + 0.5f) * _VoxelSize);
+                if (IntersectsTriangleAABB(voxelCenter, extents, tri.a, tri.b, tri.c))
+                {
+                    int idx = GetIndex(int3(x, y, z));
+                    _VoxelGrid[idx] = 1; // Surface
+                }
+            }
+        }
+    }
+}
+
+[numthreads(8, 8, 8)]
+void DilateSurface(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_GridSize.x || id.y >= (uint)_GridSize.y || id.z >= (uint)_GridSize.z) return;
+
+    int idx = GetIndex(id);
+    if (_VoxelGrid[idx] == 1)
+    {
+        _DilationOut[idx] = 1;
+        if (id.x > 0) _DilationOut[GetIndex(int3(id.x - 1, id.y, id.z))] = 1;
+        if (id.x < (uint)(_GridSize.x - 1)) _DilationOut[GetIndex(int3(id.x + 1, id.y, id.z))] = 1;
+        if (id.y > 0) _DilationOut[GetIndex(int3(id.x, id.y - 1, id.z))] = 1;
+        if (id.y < (uint)(_GridSize.y - 1)) _DilationOut[GetIndex(int3(id.x, id.y + 1, id.z))] = 1;
+        if (id.z > 0) _DilationOut[GetIndex(int3(id.x, id.y, id.z - 1))] = 1;
+        if (id.z < (uint)(_GridSize.z - 1)) _DilationOut[GetIndex(int3(id.x, id.y, id.z + 1))] = 1;
+    }
+}
+
+[numthreads(8, 8, 8)]
+void FloodFillStep(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_GridSize.x || id.y >= (uint)_GridSize.y || id.z >= (uint)_GridSize.z) return;
+
+    int idx = GetIndex(id);
+    // Boundary voxels start as exterior (255)
+    bool isBorder = (id.x == 0 || id.x == (uint)(_GridSize.x - 1) ||
+                     id.y == 0 || id.y == (uint)(_GridSize.y - 1) ||
+                     id.z == 0 || id.z == (uint)(_GridSize.z - 1));
+
+    if (isBorder && _VoxelGrid[idx] == 0)
+    {
+        _VoxelGrid[idx] = 255;
+        _ChangedFlag[0] = 1;
+        return;
+    }
+
+    if (_VoxelGrid[idx] == 0)
+    {
+        bool neighborIsExterior =
+            (id.x > 0 && _VoxelGrid[GetIndex(int3(id.x - 1, id.y, id.z))] == 255) ||
+            (id.x < (uint)(_GridSize.x - 1) && _VoxelGrid[GetIndex(int3(id.x + 1, id.y, id.z))] == 255) ||
+            (id.y > 0 && _VoxelGrid[GetIndex(int3(id.x, id.y - 1, id.z))] == 255) ||
+            (id.y < (uint)(_GridSize.y - 1) && _VoxelGrid[GetIndex(int3(id.x, id.y + 1, id.z))] == 255) ||
+            (id.z > 0 && _VoxelGrid[GetIndex(int3(id.x, id.y, id.z - 1))] == 255) ||
+            (id.z < (uint)(_GridSize.z - 1) && _VoxelGrid[GetIndex(int3(id.x, id.y, id.z + 1))] == 255);
+
+        if (neighborIsExterior)
+        {
+            _VoxelGrid[idx] = 255;
+            _ChangedFlag[0] = 1;
+        }
+    }
+}
+
+[numthreads(8, 8, 8)]
+void FinalizeSolidInterior(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_GridSize.x || id.y >= (uint)_GridSize.y || id.z >= (uint)_GridSize.z) return;
+
+    int idx = GetIndex(id);
+    uint val = _VoxelGrid[idx];
+    if (val == 0)
+    {
+        _VoxelGrid[idx] = 2; // Interior
+    }
+    else if (val == 255)
+    {
+        _VoxelGrid[idx] = 0; // Air
+    }
+}
+

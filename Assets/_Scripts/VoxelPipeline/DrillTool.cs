@@ -1,24 +1,26 @@
+using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.InputSystem;
 
 public class DrillTool : MonoBehaviour
 {
-    public float drillRadius = 1.0f;
-    public int regenerateEveryNFrames = 3;
+    public float drillRadius = 0.02f;
+    public int regenerateEveryNFrames = 1;
     private int framesSinceRegen = 0;
     
-    private PipelineManager pipelineManager;
-    private VoxelChunkManager chunkManager;
     private Camera targetCamera;
-    
-    private bool hasDirtyBounds = false;
-    private int dirtyMinX = 99999, dirtyMinY = 99999, dirtyMinZ = 99999;
-    private int dirtyMaxX = -99999, dirtyMaxY = -99999, dirtyMaxZ = -99999;
+
+    private struct DirtyBounds
+    {
+        public int minX, minY, minZ;
+        public int maxX, maxY, maxZ;
+        public bool hasDirty;
+    }
+
+    private Dictionary<VoxelChunkManager, DirtyBounds> dirtyManagers = new Dictionary<VoxelChunkManager, DirtyBounds>();
 
     private void Awake()
     {
-        pipelineManager = Object.FindFirstObjectByType<PipelineManager>();
-        chunkManager = Object.FindFirstObjectByType<VoxelChunkManager>();
         if (targetCamera == null) targetCamera = Camera.main;
     }
 
@@ -29,44 +31,54 @@ public class DrillTool : MonoBehaviour
             Ray ray = targetCamera.ScreenPointToRay(Mouse.current.position.ReadValue());
             if (Physics.Raycast(ray, out RaycastHit hit))
             {
-                if (hit.collider.GetComponent<VoxelChunkMarker>() != null)
+                VoxelChunkMarker marker = hit.collider.GetComponent<VoxelChunkMarker>();
+                if (marker != null && marker.ownerManager != null)
                 {
-                    RemoveVoxelsInSphere(hit.point, drillRadius);
+                    RemoveVoxelsInSphere(marker.ownerManager, hit.point, drillRadius);
                 }
             }
         }
 
-        if (hasDirtyBounds)
+        if (dirtyManagers.Count > 0)
         {
             framesSinceRegen++;
             if (framesSinceRegen >= regenerateEveryNFrames)
             {
-                chunkManager.RegenerateChunksInVoxelRange(dirtyMinX, dirtyMinY, dirtyMinZ, dirtyMaxX, dirtyMaxY, dirtyMaxZ);
-                
-                hasDirtyBounds = false;
+                foreach (var kvp in dirtyManagers)
+                {
+                    VoxelChunkManager mgr = kvp.Key;
+                    DirtyBounds b = kvp.Value;
+                    if (mgr != null && b.hasDirty)
+                    {
+                        mgr.RegenerateChunksInVoxelRange(b.minX, b.minY, b.minZ, b.maxX, b.maxY, b.maxZ);
+                    }
+                }
+
+                dirtyManagers.Clear();
                 framesSinceRegen = 0;
-                dirtyMinX = 99999; dirtyMinY = 99999; dirtyMinZ = 99999;
-                dirtyMaxX = -99999; dirtyMaxY = -99999; dirtyMaxZ = -99999;
             }
         }
     }
 
-    private void RemoveVoxelsInSphere(Vector3 worldPoint, float radius)
+    private void RemoveVoxelsInSphere(VoxelChunkManager chunkManager, Vector3 worldPoint, float radius)
     {
-        float vSize = BoundaryGridGenerator.voxelSize;
-        Vector3 localPoint = worldPoint - BoundaryGridGenerator.GridOrigin;
+        BoundaryGridGenerator grid = chunkManager.grid;
+        if (grid == null || grid.VoxelGrid == null) return;
+
+        float vSize = grid.voxelSize;
+        Vector3 localPoint = worldPoint - grid.GridOrigin;
         
         int radiusInVoxels = Mathf.CeilToInt(radius / vSize);
         int centerX = Mathf.RoundToInt(localPoint.x / vSize);
         int centerY = Mathf.RoundToInt(localPoint.y / vSize);
         int centerZ = Mathf.RoundToInt(localPoint.z / vSize);
 
-        int minX = Mathf.Clamp(centerX - radiusInVoxels, 0, BoundaryGridGenerator.GridWidth - 1);
-        int maxX = Mathf.Clamp(centerX + radiusInVoxels, 0, BoundaryGridGenerator.GridWidth - 1);
-        int minY = Mathf.Clamp(centerY - radiusInVoxels, 0, BoundaryGridGenerator.GridHeight - 1);
-        int maxY = Mathf.Clamp(centerY + radiusInVoxels, 0, BoundaryGridGenerator.GridHeight - 1);
-        int minZ = Mathf.Clamp(centerZ - radiusInVoxels, 0, BoundaryGridGenerator.GridDepth - 1);
-        int maxZ = Mathf.Clamp(centerZ + radiusInVoxels, 0, BoundaryGridGenerator.GridDepth - 1);
+        int minX = Mathf.Clamp(centerX - radiusInVoxels, 0, grid.GridWidth - 1);
+        int maxX = Mathf.Clamp(centerX + radiusInVoxels, 0, grid.GridWidth - 1);
+        int minY = Mathf.Clamp(centerY - radiusInVoxels, 0, grid.GridHeight - 1);
+        int maxY = Mathf.Clamp(centerY + radiusInVoxels, 0, grid.GridHeight - 1);
+        int minZ = Mathf.Clamp(centerZ - radiusInVoxels, 0, grid.GridDepth - 1);
+        int maxZ = Mathf.Clamp(centerZ + radiusInVoxels, 0, grid.GridDepth - 1);
 
         bool changed = false;
 
@@ -79,10 +91,10 @@ public class DrillTool : MonoBehaviour
                     Vector3 voxelCenter = new Vector3(x * vSize, y * vSize, z * vSize);
                     if (Vector3.Distance(voxelCenter, localPoint) <= radius)
                     {
-                        int index = x + (y * BoundaryGridGenerator.GridWidth) + (z * BoundaryGridGenerator.GridWidth * BoundaryGridGenerator.GridHeight);
-                        if (BoundaryGridGenerator.VoxelGrid[index].materialID > 0)
+                        int index = x + (y * grid.GridWidth) + (z * grid.GridWidth * grid.GridHeight);
+                        if (grid.VoxelGrid[index].materialID > 0)
                         {
-                            BoundaryGridGenerator.VoxelGrid[index].materialID = 0; // Set to air
+                            grid.VoxelGrid[index].materialID = 0; // Set to air
                             changed = true;
                         }
                     }
@@ -92,14 +104,27 @@ public class DrillTool : MonoBehaviour
 
         if (changed)
         {
-            hasDirtyBounds = true;
-            if (minX < dirtyMinX) dirtyMinX = minX;
-            if (minY < dirtyMinY) dirtyMinY = minY;
-            if (minZ < dirtyMinZ) dirtyMinZ = minZ;
-            if (maxX > dirtyMaxX) dirtyMaxX = maxX;
-            if (maxY > dirtyMaxY) dirtyMaxY = maxY;
-            if (maxZ > dirtyMaxZ) dirtyMaxZ = maxZ;
+            if (!dirtyManagers.TryGetValue(chunkManager, out DirtyBounds b))
+            {
+                b = new DirtyBounds
+                {
+                    minX = minX, minY = minY, minZ = minZ,
+                    maxX = maxX, maxY = maxY, maxZ = maxZ,
+                    hasDirty = true
+                };
+            }
+            else
+            {
+                if (minX < b.minX) b.minX = minX;
+                if (minY < b.minY) b.minY = minY;
+                if (minZ < b.minZ) b.minZ = minZ;
+                if (maxX > b.maxX) b.maxX = maxX;
+                if (maxY > b.maxY) b.maxY = maxY;
+                if (maxZ > b.maxZ) b.maxZ = maxZ;
+                b.hasDirty = true;
+            }
+
+            dirtyManagers[chunkManager] = b;
         }
     }
 }
-

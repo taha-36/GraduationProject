@@ -1,0 +1,93 @@
+#pragma kernel MarchCubesRegion
+
+struct GeneratedTriangle
+{
+    float3 a;
+    float3 b;
+    float3 c;
+};
+
+AppendStructuredBuffer<GeneratedTriangle> _TrianglesOut;
+StructuredBuffer<uint> _VoxelGrid;
+
+StructuredBuffer<int> _EdgeTable;
+StructuredBuffer<int> _TriTable; // Flattened 256 * 16
+
+int3 _GridSize; // Total grid dimensions
+int3 _RegionStart;
+int3 _RegionSize;
+float3 _GridOrigin;
+float _VoxelSize;
+
+static const float3 CornerOffsets[8] = {
+    float3(0, 0, 0), float3(1, 0, 0), float3(1, 0, 1), float3(0, 0, 1),
+    float3(0, 1, 0), float3(1, 1, 0), float3(1, 1, 1), float3(0, 1, 1)
+};
+
+static const int cornerIndexAFromEdge[12] = {
+    0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3
+};
+
+static const int cornerIndexBFromEdge[12] = {
+    1, 2, 3, 0, 5, 6, 7, 4, 4, 5, 6, 7
+};
+
+int GetGridIndex(int3 coord)
+{
+    int cx = clamp(coord.x, 0, _GridSize.x - 1);
+    int cy = clamp(coord.y, 0, _GridSize.y - 1);
+    int cz = clamp(coord.z, 0, _GridSize.z - 1);
+    return cx + cy * _GridSize.x + cz * _GridSize.x * _GridSize.y;
+}
+
+float3 GetEdgeMidpoint(float3 corners[8], int edgeIndex)
+{
+    int cA = cornerIndexAFromEdge[edgeIndex];
+    int cB = cornerIndexBFromEdge[edgeIndex];
+    return lerp(corners[cA], corners[cB], 0.5f);
+}
+
+[numthreads(8, 8, 8)]
+void MarchCubesRegion(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_RegionSize.x || id.y >= (uint)_RegionSize.y || id.z >= (uint)_RegionSize.z) return;
+
+    int3 coord = _RegionStart + int3(id);
+
+    int cubeIndex = 0;
+    float3 corners[8];
+
+    // Align corners with voxel centers so the isosurface matches the exact triangle boundary
+    float3 halfVoxel = float3(_VoxelSize * 0.5f, _VoxelSize * 0.5f, _VoxelSize * 0.5f);
+
+    [unroll]
+    for (int i = 0; i < 8; i++)
+    {
+        int3 cCoord = coord + int3(CornerOffsets[i]);
+        corners[i] = _GridOrigin + float3(cCoord) * _VoxelSize + halfVoxel;
+
+        int gridIdx = GetGridIndex(cCoord);
+        if (_VoxelGrid[gridIdx] > 0)
+        {
+            cubeIndex |= (1 << i);
+        }
+    }
+
+    if (_EdgeTable[cubeIndex] == 0) return;
+
+    for (int t = 0; t < 15; t += 3)
+    {
+        int edge0 = _TriTable[cubeIndex * 16 + t];
+        if (edge0 == -1) break;
+
+        int edge1 = _TriTable[cubeIndex * 16 + t + 1];
+        int edge2 = _TriTable[cubeIndex * 16 + t + 2];
+
+        GeneratedTriangle tri;
+        tri.a = GetEdgeMidpoint(corners, edge0);
+        tri.b = GetEdgeMidpoint(corners, edge1);
+        tri.c = GetEdgeMidpoint(corners, edge2);
+
+        _TrianglesOut.Append(tri);
+    }
+}

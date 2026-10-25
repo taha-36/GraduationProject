@@ -1,21 +1,44 @@
 using System.Collections.Generic;
 using UnityEngine;
 
-public static class BoundaryGridGenerator
+public class BoundaryGridGenerator
 {
-    public static float voxelSize = 0.1f;
-    public static Bounds MeshBounds;
-    public static int GridWidth, GridHeight, GridDepth;
-    public static Vector3 GridOrigin;
-    public static Voxel[] VoxelGrid;
-    public static bool IsGenerated = false;
+    public float voxelSize = 0.1f;
+    public Bounds MeshBounds;
+    public int GridWidth, GridHeight, GridDepth;
+    public Vector3 GridOrigin;
+    public Voxel[] VoxelGrid;
+    public bool IsGenerated = false;
 
-    public static void GenerateBoundary(Renderer meshRenderer)
+    private struct GPUTriangle
     {
-        MeshFilter meshFilter = meshRenderer.GetComponent<MeshFilter>();
-        if (meshFilter == null || meshFilter.sharedMesh == null) return;
+        public Vector3 a;
+        public Vector3 b;
+        public Vector3 c;
+    }
 
-        // *** FIX: Expand bounding box by a large margin to prevent holes/clipping ***
+    private static ComputeShader voxelizeShader;
+
+    private static void EnsureShaderLoaded()
+    {
+        if (voxelizeShader == null)
+        {
+            voxelizeShader = Resources.Load<ComputeShader>("Voxelize");
+            if (voxelizeShader == null)
+            {
+#if UNITY_EDITOR
+                voxelizeShader = UnityEditor.AssetDatabase.LoadAssetAtPath<ComputeShader>("Assets/Shaders/Voxelize.compute");
+#endif
+            }
+        }
+    }
+
+    public void GenerateBoundary(Renderer meshRenderer)
+    {
+        if (meshRenderer == null) return;
+        MeshFilter mf = meshRenderer.GetComponent<MeshFilter>();
+        if (mf == null || mf.sharedMesh == null) return;
+
         Bounds baseBounds = meshRenderer.bounds;
         baseBounds.Expand(voxelSize * 10f); // 5 voxels of padding on all sides
 
@@ -28,24 +51,83 @@ public static class BoundaryGridGenerator
         int totalVoxels = GridWidth * GridHeight * GridDepth;
         VoxelGrid = new Voxel[totalVoxels];
 
-        Mesh mesh = meshFilter.sharedMesh;
+        Mesh mesh = mf.sharedMesh;
         Vector3[] vertices = mesh.vertices;
         int[] triangles = mesh.triangles;
-        Transform transform = meshRenderer.transform;
+        Transform tr = meshRenderer.transform;
 
-        Vector3[] worldVertices = new Vector3[vertices.Length];
-        for (int i = 0; i < vertices.Length; i++)
-        {
-            worldVertices[i] = transform.TransformPoint(vertices[i]);
-        }
-
-        Vector3 extents = new Vector3(voxelSize / 2, voxelSize / 2, voxelSize / 2);
+        int triCount = triangles.Length / 3;
+        List<GPUTriangle> allTriangles = new List<GPUTriangle>(triCount);
 
         for (int i = 0; i < triangles.Length; i += 3)
         {
-            Vector3 v0 = worldVertices[triangles[i]];
-            Vector3 v1 = worldVertices[triangles[i + 1]];
-            Vector3 v2 = worldVertices[triangles[i + 2]];
+            allTriangles.Add(new GPUTriangle
+            {
+                a = tr.TransformPoint(vertices[triangles[i]]),
+                b = tr.TransformPoint(vertices[triangles[i + 1]]),
+                c = tr.TransformPoint(vertices[triangles[i + 2]])
+            });
+        }
+
+        if (allTriangles.Count == 0) return;
+
+        EnsureShaderLoaded();
+
+        if (SystemInfo.supportsComputeShaders && voxelizeShader != null)
+        {
+            GenerateBoundaryGPU(allTriangles, totalVoxels);
+        }
+        else
+        {
+            GenerateBoundaryCPU(allTriangles);
+        }
+    }
+
+    private void GenerateBoundaryGPU(List<GPUTriangle> allTriangles, int totalVoxels)
+    {
+        int triCount = allTriangles.Count;
+        GPUTriangle[] gpuTriangles = allTriangles.ToArray();
+
+        ComputeBuffer triangleBuffer = new ComputeBuffer(triCount, sizeof(float) * 9);
+        triangleBuffer.SetData(gpuTriangles);
+
+        ComputeBuffer voxelBuffer = new ComputeBuffer(totalVoxels, sizeof(uint));
+        uint[] zeroGrid = new uint[totalVoxels];
+        voxelBuffer.SetData(zeroGrid);
+
+        int kernel = voxelizeShader.FindKernel("VoxelizeTriangles");
+        voxelizeShader.SetBuffer(kernel, "_Triangles", triangleBuffer);
+        voxelizeShader.SetBuffer(kernel, "_VoxelGrid", voxelBuffer);
+
+        voxelizeShader.SetInt("_TriangleCount", triCount);
+        voxelizeShader.SetInts("_GridSize", GridWidth, GridHeight, GridDepth);
+        voxelizeShader.SetFloats("_GridOrigin", GridOrigin.x, GridOrigin.y, GridOrigin.z);
+        voxelizeShader.SetFloat("_VoxelSize", voxelSize);
+
+        int threadGroups = Mathf.CeilToInt(triCount / 64.0f);
+        voxelizeShader.Dispatch(kernel, threadGroups, 1, 1);
+
+        uint[] resultGrid = new uint[totalVoxels];
+        voxelBuffer.GetData(resultGrid);
+
+        for (int i = 0; i < totalVoxels; i++)
+        {
+            VoxelGrid[i].materialID = (byte)resultGrid[i];
+        }
+
+        triangleBuffer.Release();
+        voxelBuffer.Release();
+    }
+
+    private void GenerateBoundaryCPU(List<GPUTriangle> allTriangles)
+    {
+        Vector3 extents = new Vector3(voxelSize / 2, voxelSize / 2, voxelSize / 2);
+
+        for (int i = 0; i < allTriangles.Count; i++)
+        {
+            Vector3 v0 = allTriangles[i].a;
+            Vector3 v1 = allTriangles[i].b;
+            Vector3 v2 = allTriangles[i].c;
 
             Vector3 min = Vector3.Min(v0, Vector3.Min(v1, v2));
             Vector3 max = Vector3.Max(v0, Vector3.Max(v1, v2));
@@ -71,7 +153,63 @@ public static class BoundaryGridGenerator
         }
     }
 
-    public static void CloseSurfaceGaps(int dilationPasses)
+    public void CloseSurfaceGaps(int dilationPasses)
+    {
+        if (dilationPasses <= 0 || VoxelGrid == null || VoxelGrid.Length == 0) return;
+
+        EnsureShaderLoaded();
+
+        if (SystemInfo.supportsComputeShaders && voxelizeShader != null)
+        {
+            CloseSurfaceGapsGPU(dilationPasses);
+        }
+        else
+        {
+            CloseSurfaceGapsCPU(dilationPasses);
+        }
+    }
+
+    private void CloseSurfaceGapsGPU(int dilationPasses)
+    {
+        int totalVoxels = VoxelGrid.Length;
+        ComputeBuffer gridBufferA = new ComputeBuffer(totalVoxels, sizeof(uint));
+        ComputeBuffer gridBufferB = new ComputeBuffer(totalVoxels, sizeof(uint));
+
+        uint[] uintGrid = new uint[totalVoxels];
+        for (int i = 0; i < totalVoxels; i++) uintGrid[i] = VoxelGrid[i].materialID;
+
+        gridBufferA.SetData(uintGrid);
+        gridBufferB.SetData(uintGrid);
+
+        int kernel = voxelizeShader.FindKernel("DilateSurface");
+        voxelizeShader.SetInts("_GridSize", GridWidth, GridHeight, GridDepth);
+
+        int tgX = Mathf.CeilToInt(GridWidth / 8.0f);
+        int tgY = Mathf.CeilToInt(GridHeight / 8.0f);
+        int tgZ = Mathf.CeilToInt(GridDepth / 8.0f);
+
+        for (int p = 0; p < dilationPasses; p++)
+        {
+            voxelizeShader.SetBuffer(kernel, "_VoxelGrid", gridBufferA);
+            voxelizeShader.SetBuffer(kernel, "_DilationOut", gridBufferB);
+            voxelizeShader.Dispatch(kernel, tgX, tgY, tgZ);
+
+            ComputeBuffer temp = gridBufferA;
+            gridBufferA = gridBufferB;
+            gridBufferB = temp;
+        }
+
+        gridBufferA.GetData(uintGrid);
+        for (int i = 0; i < totalVoxels; i++)
+        {
+            if (uintGrid[i] == 1) VoxelGrid[i].materialID = 1;
+        }
+
+        gridBufferA.Release();
+        gridBufferB.Release();
+    }
+
+    private void CloseSurfaceGapsCPU(int dilationPasses)
     {
         for (int p = 0; p < dilationPasses; p++)
         {
@@ -96,8 +234,10 @@ public static class BoundaryGridGenerator
         }
     }
 
-    public static void SolidifyInterior()
+    public void SolidifyInterior()
     {
+        if (VoxelGrid == null || VoxelGrid.Length == 0) return;
+
         Queue<int> queue = new Queue<int>();
         queue.Enqueue(0);
         VoxelGrid[0].materialID = 255; // Temp exterior
@@ -125,7 +265,7 @@ public static class BoundaryGridGenerator
         IsGenerated = true;
     }
 
-    private static void CheckAndEnqueue(int index, Queue<int> queue)
+    private void CheckAndEnqueue(int index, Queue<int> queue)
     {
         if (VoxelGrid[index].materialID == 0)
         {
@@ -134,4 +274,3 @@ public static class BoundaryGridGenerator
         }
     }
 }
-

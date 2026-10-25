@@ -8,6 +8,12 @@ public class VoxelChunkManager : MonoBehaviour
     public int chunkSize = 16;
     [Range(0, 6)] public int smoothingIterations = 3;
 
+    [HideInInspector]
+    public BoundaryGridGenerator grid;
+
+    [HideInInspector]
+    public Renderer sourceRenderer;
+
     private MarchingCubesGenerator generator;
     private Dictionary<Vector3Int, GameObject> chunks = new Dictionary<Vector3Int, GameObject>();
     private Transform chunkRoot;
@@ -17,16 +23,26 @@ public class VoxelChunkManager : MonoBehaviour
         generator = GetComponent<MarchingCubesGenerator>();
     }
 
+    public void Initialize(BoundaryGridGenerator boundaryGrid, Renderer rendererSource, Material mat = null)
+    {
+        grid = boundaryGrid;
+        sourceRenderer = rendererSource;
+        if (mat != null) chunkMaterial = mat;
+        if (generator == null) generator = GetComponent<MarchingCubesGenerator>();
+        generator.EnsureShaderLoaded();
+    }
+
     public void BuildAllChunks()
     {
+        if (grid == null || grid.VoxelGrid == null || grid.VoxelGrid.Length == 0) return;
         if (generator == null) generator = GetComponent<MarchingCubesGenerator>();
         ClearChunks();
         
-        int w = BoundaryGridGenerator.GridWidth;
-        int h = BoundaryGridGenerator.GridHeight;
-        int d = BoundaryGridGenerator.GridDepth;
+        int w = grid.GridWidth;
+        int h = grid.GridHeight;
+        int d = grid.GridDepth;
 
-        Mesh fullMesh = generator.GenerateMeshForRegion(0, 0, 0, w, h, d);
+        Mesh fullMesh = generator.GenerateMeshForRegion(grid, 0, 0, 0, w, h, d);
         if (fullMesh != null && fullMesh.vertexCount > 0 && smoothingIterations > 0)
         {
             MeshSmoother.SmoothMesh(fullMesh, smoothingIterations);
@@ -44,19 +60,26 @@ public class VoxelChunkManager : MonoBehaviour
 
     public void RegenerateChunksInVoxelRange(int minX, int minY, int minZ, int maxX, int maxY, int maxZ)
     {
+        if (grid == null) return;
+
         int padStartX = Mathf.Max(0, ((minX / chunkSize) - 1) * chunkSize);
         int padStartY = Mathf.Max(0, ((minY / chunkSize) - 1) * chunkSize);
         int padStartZ = Mathf.Max(0, ((minZ / chunkSize) - 1) * chunkSize);
         
-        int padEndX = Mathf.Min(BoundaryGridGenerator.GridWidth, ((maxX / chunkSize) + 2) * chunkSize);
-        int padEndY = Mathf.Min(BoundaryGridGenerator.GridHeight, ((maxY / chunkSize) + 2) * chunkSize);
-        int padEndZ = Mathf.Min(BoundaryGridGenerator.GridDepth, ((maxZ / chunkSize) + 2) * chunkSize);
+        int padEndX = Mathf.Min(grid.GridWidth, ((maxX / chunkSize) + 2) * chunkSize);
+        int padEndY = Mathf.Min(grid.GridHeight, ((maxY / chunkSize) + 2) * chunkSize);
+        int padEndZ = Mathf.Min(grid.GridDepth, ((maxZ / chunkSize) + 2) * chunkSize);
 
         int sizeX = padEndX - padStartX;
         int sizeY = padEndY - padStartY;
         int sizeZ = padEndZ - padStartZ;
 
-        Mesh regionalMesh = generator.GenerateMeshForRegion(padStartX, padStartY, padStartZ, sizeX, sizeY, sizeZ);
+        if (generator.useComputeShader)
+        {
+            generator.UpdateVoxelGridBuffer(grid);
+        }
+
+        Mesh regionalMesh = generator.GenerateMeshForRegion(grid, padStartX, padStartY, padStartZ, sizeX, sizeY, sizeZ);
         if (regionalMesh != null && regionalMesh.vertexCount > 0 && smoothingIterations > 0)
         {
             MeshSmoother.SmoothMesh(regionalMesh, smoothingIterations);
@@ -81,8 +104,8 @@ public class VoxelChunkManager : MonoBehaviour
         
         Dictionary<Vector3Int, List<int>> chunkTris = new Dictionary<Vector3Int, List<int>>();
         
-        float vSize = BoundaryGridGenerator.voxelSize;
-        Vector3 origin = BoundaryGridGenerator.GridOrigin;
+        float vSize = grid.voxelSize;
+        Vector3 origin = grid.GridOrigin;
         float chunkWorldSize = chunkSize * vSize;
 
         for (int i = 0; i < tris.Length; i += 3)
@@ -162,10 +185,11 @@ public class VoxelChunkManager : MonoBehaviour
         }
         else
         {
+            string rootName = sourceRenderer != null ? $"VoxelChunks_{sourceRenderer.gameObject.name}" : "VoxelChunksRoot";
             if (chunkRoot == null)
             {
-                GameObject rootObj = GameObject.Find("VoxelChunksRoot");
-                if (rootObj == null) rootObj = new GameObject("VoxelChunksRoot");
+                GameObject rootObj = GameObject.Find(rootName);
+                if (rootObj == null) rootObj = new GameObject(rootName);
                 chunkRoot = rootObj.transform;
                 chunkRoot.position = Vector3.zero;
                 chunkRoot.rotation = Quaternion.identity;
@@ -179,22 +203,34 @@ public class VoxelChunkManager : MonoBehaviour
             chunkObj.transform.localScale = Vector3.one;
 
             chunkObj.AddComponent<MeshFilter>().sharedMesh = mesh;
-            chunkObj.AddComponent<MeshRenderer>().material = chunkMaterial;
+            Material matToUse = chunkMaterial != null ? chunkMaterial : (sourceRenderer != null ? sourceRenderer.sharedMaterial : null);
+            chunkObj.AddComponent<MeshRenderer>().material = matToUse;
             chunkObj.AddComponent<MeshCollider>().sharedMesh = mesh;
-            chunkObj.AddComponent<VoxelChunkMarker>();
+            
+            VoxelChunkMarker marker = chunkObj.AddComponent<VoxelChunkMarker>();
+            marker.ownerManager = this;
 
             chunks[pos] = chunkObj;
         }
     }
 
-    private void ClearChunks()
+    public void ClearChunks()
     {
         foreach (var chunk in chunks.Values)
         {
-            if (Application.isPlaying) Destroy(chunk);
-            else DestroyImmediate(chunk);
+            if (chunk != null)
+            {
+                if (Application.isPlaying) Destroy(chunk);
+                else DestroyImmediate(chunk);
+            }
         }
         chunks.Clear();
+
+        if (chunkRoot != null)
+        {
+            if (Application.isPlaying) Destroy(chunkRoot.gameObject);
+            else DestroyImmediate(chunkRoot.gameObject);
+            chunkRoot = null;
+        }
     }
 }
-

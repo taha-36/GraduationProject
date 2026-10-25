@@ -519,4 +519,17 @@ public static class MarchingCubesTables
     { 0, 3, 8, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 },
     {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 }
     };
+
+    public static int[] GetFlatTriTable()
+    {
+        int[] flat = new int[256 * 16];
+        for (int i = 0; i < 256; i++)
+        {
+            for (int j = 0; j < 16; j++)
+            {
+                flat[i * 16 + j] = TriTable[i, j];
+            }
+        }
+        return flat;
+    }
 }
