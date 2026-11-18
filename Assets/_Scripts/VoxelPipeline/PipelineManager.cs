@@ -9,8 +9,8 @@ public class PipelineManager : MonoBehaviour
     [Range(0, 5)]
     public int dilationPasses = 0;
 
-    [Range(0, 6)]
-    public int smoothingIterations = 0;
+    [Range(0, 50)]
+    public int smoothingIterations = 6;
 
     public int chunkSize = 16;
     public Material chunkMaterial;

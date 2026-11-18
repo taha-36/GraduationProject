@@ -6,7 +6,7 @@ public class VoxelChunkManager : MonoBehaviour
 {
     public Material chunkMaterial;
     public int chunkSize = 16;
-    [Range(0, 6)] public int smoothingIterations = 3;
+    [Range(0, 50)] public int smoothingIterations = 6;
 
     [HideInInspector]
     public BoundaryGridGenerator grid;
