@@ -32,6 +32,11 @@ public class MPU6050DrillControllerEditor : Editor
     {
         MPU6050DrillController controller = (MPU6050DrillController)target;
 
+        if (availablePorts == null || availablePorts.Length == 0)
+        {
+            RefreshPorts();
+        }
+
         // Mode switch header
         EditorGUILayout.Space(5);
         EditorGUILayout.BeginHorizontal();
@@ -72,32 +77,34 @@ public class MPU6050DrillControllerEditor : Editor
             GUI.color = Color.white;
         }
 
-        // Port selection helper (only relevant when hardware mode is active)
-        if (!controller.simulationMode)
+        // Port selection helper (always accessible)
+        EditorGUILayout.Space(5);
+        EditorGUILayout.LabelField("Serial COM Port Selection", EditorStyles.boldLabel);
+        EditorGUILayout.BeginHorizontal();
+        if (availablePorts != null && availablePorts.Length > 0)
         {
-            EditorGUILayout.Space(5);
-            EditorGUILayout.LabelField("Serial Port Selection", EditorStyles.boldLabel);
-            EditorGUILayout.BeginHorizontal();
-            if (availablePorts != null && availablePorts.Length > 0)
+            int newIndex = EditorGUILayout.Popup("Detected Ports", selectedPortIndex, availablePorts);
+            if (newIndex != selectedPortIndex && newIndex >= 0 && newIndex < availablePorts.Length)
             {
-                int newIndex = EditorGUILayout.Popup("Detected Ports", selectedPortIndex, availablePorts);
-                if (newIndex != selectedPortIndex && newIndex >= 0 && newIndex < availablePorts.Length)
-                {
-                    selectedPortIndex = newIndex;
-                    controller.portName = availablePorts[selectedPortIndex];
-                    EditorUtility.SetDirty(controller);
-                }
+                selectedPortIndex = newIndex;
+                controller.portName = availablePorts[selectedPortIndex];
+                EditorUtility.SetDirty(controller);
             }
-            else
-            {
-                EditorGUILayout.LabelField("No COM ports detected.");
-            }
+        }
+        else
+        {
+            EditorGUILayout.LabelField("No COM ports detected.");
+        }
 
-            if (GUILayout.Button("Refresh", GUILayout.Width(70)))
-            {
-                RefreshPorts();
-            }
-            EditorGUILayout.EndHorizontal();
+        if (GUILayout.Button("Refresh", GUILayout.Width(70)))
+        {
+            RefreshPorts();
+        }
+        EditorGUILayout.EndHorizontal();
+
+        if (availablePorts == null || availablePorts.Length == 0 || !System.Array.Exists(availablePorts, p => p.Equals(controller.portName, System.StringComparison.OrdinalIgnoreCase)))
+        {
+            EditorGUILayout.HelpBox($"Target port '{controller.portName}' is not currently plugged into this PC. When you plug in your Arduino/microcontroller via USB, it will appear here. (Note: Keyboards and mice are USB HID devices, not Serial COM ports).", MessageType.None);
         }
 
         EditorGUILayout.Space(5);

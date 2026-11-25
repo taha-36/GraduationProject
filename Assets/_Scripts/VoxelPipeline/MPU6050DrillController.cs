@@ -41,8 +41,8 @@ public class MPU6050DrillController : MonoBehaviour
     public float simMotionSpeed = 1.0f;
 
     [Header("Serial Port Configuration")]
-    [Tooltip("The serial COM port the microcontroller is connected to (e.g. COM19)")]
-    public string portName = "COM19";
+    [Tooltip("The serial COM port the microcontroller is connected to (e.g. COM9)")]
+    public string portName = "COM9";
 
     [Tooltip("Baud rate matching the microcontroller Serial.begin (e.g. 115200)")]
     public int baudRate = 115200;
@@ -58,7 +58,11 @@ public class MPU6050DrillController : MonoBehaviour
     public Transform targetTransform;
 
     [Header("Coordinate Mapping")]
+    [Tooltip("Standard assumes MPU +X points right, +Y forward, and +Z up.")]
     public CoordinatePreset coordinatePreset = CoordinatePreset.MPU6050_DMP_Standard;
+
+    [Tooltip("Rotation in degrees from the converted sensor axes to the drill's local axes. Use this to match the physical board mounting.")]
+    public Vector3 sensorToDrillEulerAngles = Vector3.zero;
 
     [Tooltip("Invert X rotation")]
     public bool invertX = false;
@@ -67,7 +71,7 @@ public class MPU6050DrillController : MonoBehaviour
     public bool invertY = false;
 
     [Tooltip("Invert Z rotation")]
-    public bool invertZ = false;
+    public bool invertZ = true;
 
     [Header("Calibration / Tare")]
     [Tooltip("Press this key in play mode to tare / calibrate the current orientation as neutral")]
@@ -75,7 +79,7 @@ public class MPU6050DrillController : MonoBehaviour
 
     [Header("Smoothing")]
     [Tooltip("Smooth raw sensor data using spherical interpolation")]
-    public bool useSmoothing = true;
+    public bool useSmoothing = false;
 
     [Range(1f, 50f)]
     [Tooltip("Smoothing speed. Higher values track faster with less delay")]
@@ -85,7 +89,10 @@ public class MPU6050DrillController : MonoBehaviour
     [SerializeField] private bool isConnected = false;
     [SerializeField] private int packetsPerSecond = 0;
     [SerializeField] private Vector4 rawQuaternion = new Vector4(1, 0, 0, 0);
-    [SerializeField] private Vector3 currentEulerAngles = Vector3.zero;
+    [Tooltip("Total angle reported by the sensor since tare, in degrees (0 to 180).")]
+    [SerializeField] private float sensorDegreesFromNeutral;
+    [Tooltip("Total angle of the drill from its starting pose, in degrees (0 to 180).")]
+    [SerializeField] private float drillDegreesFromNeutral;
 
     public bool IsConnected => isConnected;
     public int PacketsPerSecond => packetsPerSecond;
@@ -113,13 +120,12 @@ public class MPU6050DrillController : MonoBehaviour
     private volatile bool isRunning = false;
 
     private readonly object lockObj = new object();
-    private Quaternion latestRawRotation = Quaternion.identity;
     private bool hasReceivedFirstPacket = false;
     private int packetCountCounter = 0;
     private float lastPpsTime = 0f;
 
     // Tare / neutral offset
-    private Quaternion tareOffset = Quaternion.identity;
+    private Vector4 neutralRawQuaternion = new Vector4(1, 0, 0, 0);
     private Quaternion initialLocalRotation = Quaternion.identity;
     private float reconnectTimer = 0f;
 
@@ -180,14 +186,18 @@ public class MPU6050DrillController : MonoBehaviour
         // Apply orientation to target transform
         if (hasReceivedFirstPacket && targetTransform != null)
         {
-            Quaternion rawRot;
+            Vector4 sample;
             lock (lockObj)
             {
-                rawRot = latestRawRotation;
+                sample = rawQuaternion;
             }
 
-            // Apply tare offset
-            Quaternion relativeRot = tareOffset * rawRot;
+            Quaternion neutralRotation = ConvertToUnityQuaternion(neutralRawQuaternion);
+            Quaternion relativeRot = Quaternion.Inverse(neutralRotation) * ConvertToUnityQuaternion(sample);
+            sensorDegreesFromNeutral = Quaternion.Angle(Quaternion.identity, relativeRot);
+            // Rotate the local motion axes into the drill's axes while keeping the tared pose neutral.
+            Quaternion sensorToDrill = Quaternion.Euler(sensorToDrillEulerAngles);
+            relativeRot = sensorToDrill * relativeRot * Quaternion.Inverse(sensorToDrill);
             Quaternion desiredRotation = initialLocalRotation * relativeRot;
 
             if (useSmoothing)
@@ -199,7 +209,7 @@ public class MPU6050DrillController : MonoBehaviour
                 targetTransform.localRotation = desiredRotation;
             }
 
-            currentEulerAngles = targetTransform.localEulerAngles;
+            drillDegreesFromNeutral = Quaternion.Angle(initialLocalRotation, targetTransform.localRotation);
         }
     }
 
@@ -242,21 +252,10 @@ public class MPU6050DrillController : MonoBehaviour
                     break;
             }
 
-            // Invert the DMP conversion so we generate authentic (w, x, y, z) sensor packets
-            // For MPU6050_DMP_Standard: Unity(x, y, z, w) comes from MPU (-x, -z, y, w)
-            // So MPU x = -sim.x, MPU y = sim.z, MPU z = -sim.y, MPU w = sim.w
-            float sw = simQuat.w;
-            float sx = -simQuat.x;
-            float sy = simQuat.z;
-            float sz = -simQuat.y;
-
-            // Feed through conversion logic
-            Quaternion convertedRot = ConvertToUnityQuaternion(sw, sx, sy, sz);
-
+            // Encode Unity motion as a standard DMP sample so simulation exercises the same mapping.
             lock (lockObj)
             {
-                latestRawRotation = convertedRot;
-                rawQuaternion = new Vector4(sw, sx, sy, sz);
+                rawQuaternion = new Vector4(simQuat.w, -simQuat.x, -simQuat.y, -simQuat.z);
                 hasReceivedFirstPacket = true;
                 packetCountCounter++;
             }
@@ -274,17 +273,29 @@ public class MPU6050DrillController : MonoBehaviour
 
         if (isConnected) return;
 
+        string cleanPort = string.IsNullOrWhiteSpace(portName) ? "COM9" : portName.Trim();
+        // On Windows, COM ports >= 10 often require \\.\COMxx prefix
+        string devicePath = cleanPort;
+        if (cleanPort.StartsWith("COM", StringComparison.OrdinalIgnoreCase) &&
+            int.TryParse(cleanPort.Substring(3), out int portNum) && portNum >= 10)
+        {
+            devicePath = @"\\.\" + cleanPort;
+        }
+
         try
         {
-            serialPort = new SerialPort(portName, baudRate, Parity.None, 8, StopBits.One)
+            serialPort = new SerialPort(devicePath, baudRate, Parity.None, 8, StopBits.One)
             {
-                ReadTimeout = 100,
-                WriteTimeout = 100,
-                DtrEnable = true, // Required for many Arduino boards
+                ReadTimeout = 500,
+                WriteTimeout = 500,
+                DtrEnable = true, // Required for many Arduino / ESP32 boards to reset & stream
                 RtsEnable = true
             };
 
             serialPort.Open();
+            // Discard any residual junk or partial bytes from buffer
+            try { serialPort.DiscardInBuffer(); } catch { }
+
             isConnected = true;
             isRunning = true;
 
@@ -295,17 +306,17 @@ public class MPU6050DrillController : MonoBehaviour
             };
             readThread.Start();
 
-            Debug.Log($"<color=green>[MPU6050]</color> Successfully connected to {portName} at {baudRate} baud.");
+            Debug.Log($"<color=green>[MPU6050]</color> Successfully connected to {cleanPort} at {baudRate} baud.");
         }
-        catch (UnauthorizedAccessException)
+        catch (UnauthorizedAccessException ex)
         {
             isConnected = false;
-            Debug.LogWarning($"<color=orange>[MPU6050]</color> Port {portName} is already in use. If the Arduino Serial Monitor or another program is open on {portName}, please close it.");
+            Debug.LogError($"<color=red>[MPU6050]</color> Access denied to {cleanPort}. An external application (such as the Arduino Serial Monitor, Cura, or PuTTY) has this port locked exclusively. Please close the Arduino Serial Monitor window and retry! Details: {ex.Message}");
         }
         catch (Exception ex)
         {
             isConnected = false;
-            Debug.LogWarning($"<color=orange>[MPU6050]</color> Could not open {portName}: {ex.Message}");
+            Debug.LogError($"<color=red>[MPU6050]</color> Could not open {cleanPort}: {ex.GetType().Name} - {ex.Message}");
         }
     }
 
@@ -353,26 +364,38 @@ public class MPU6050DrillController : MonoBehaviour
     {
         lock (lockObj)
         {
-            tareOffset = Quaternion.Inverse(latestRawRotation);
+            neutralRawQuaternion = rawQuaternion;
         }
         Debug.Log("<color=cyan>[MPU6050]</color> Orientation tared to current pose.");
     }
 
     public void ResetTare()
     {
-        tareOffset = Quaternion.identity;
+        neutralRawQuaternion = new Vector4(1, 0, 0, 0);
         Debug.Log("<color=cyan>[MPU6050]</color> Tare offset reset to identity.");
     }
 
     private void ReadSerialThread()
     {
         char[] delimiters = new char[] { '\t', ' ', ',' };
+        string partialLine = string.Empty;
 
         while (isRunning && serialPort != null && serialPort.IsOpen)
         {
             try
             {
-                string line = serialPort.ReadLine();
+                string line = partialLine + serialPort.ReadLine();
+                partialLine = string.Empty;
+                // Prefer the newest complete sample if the serial reader fell behind.
+                string queued = serialPort.ReadExisting();
+                int end = queued.LastIndexOf('\n');
+                if (end >= 0)
+                {
+                    int start = end == 0 ? 0 : queued.LastIndexOf('\n', end - 1) + 1;
+                    string newest = queued.Substring(start, end - start);
+                    if (!string.IsNullOrWhiteSpace(newest)) line = newest;
+                }
+                partialLine = queued.Substring(end + 1);
                 if (string.IsNullOrWhiteSpace(line)) continue;
 
                 // Format: w \t x \t y \t z
@@ -395,11 +418,8 @@ public class MPU6050DrillController : MonoBehaviour
                             y *= invMag;
                             z *= invMag;
 
-                            Quaternion convertedRot = ConvertToUnityQuaternion(w, x, y, z);
-
                             lock (lockObj)
                             {
-                                latestRawRotation = convertedRot;
                                 rawQuaternion = new Vector4(w, x, y, z);
                                 hasReceivedFirstPacket = true;
                                 packetCountCounter++;
@@ -419,43 +439,30 @@ public class MPU6050DrillController : MonoBehaviour
         }
     }
 
-    private Quaternion ConvertToUnityQuaternion(float w, float x, float y, float z)
+    private Quaternion ConvertToUnityQuaternion(Vector4 sample)
     {
-        float ux, uy, uz, uw;
+        float w = sample.x;
+        float x = sample.y;
+        float y = sample.z;
+        float z = sample.w;
 
-        switch (coordinatePreset)
+        float ux = x;
+        float uy = y;
+        float uz = z;
+        if (coordinatePreset == CoordinatePreset.MPU6050_DMP_Standard)
         {
-            case CoordinatePreset.MPU6050_DMP_Standard:
-                // Standard right-handed MPU DMP frame to left-handed Unity frame:
-                // MPU: X forward, Y right, Z up (or variations).
-                // In Unity: X right, Y up, Z forward.
-                ux = -x;
-                uy = -z;
-                uz = y;
-                uw = w;
-                break;
-
-            case CoordinatePreset.Direct:
-                ux = x;
-                uy = y;
-                uz = z;
-                uw = w;
-                break;
-
-            case CoordinatePreset.Custom:
-            default:
-                ux = x;
-                uy = y;
-                uz = z;
-                uw = w;
-                break;
+            // The MPU Y/Z axes are opposite to the desired Unity drill Y/Z axes.
+            // Negating both components makes MPU Y drive Unity Y and MPU Z drive Unity Z.
+            ux = -x;
+            uy = -y;
+            uz = -z;
         }
 
         if (invertX) ux = -ux;
         if (invertY) uy = -uy;
         if (invertZ) uz = -uz;
 
-        return new Quaternion(ux, uy, uz, uw);
+        return new Quaternion(ux, uy, uz, w);
     }
 
     private void OnDisable()
